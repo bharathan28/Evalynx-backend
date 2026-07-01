@@ -1,4 +1,4 @@
-# AI Interview Assessment Platform — Backend
+# Evalynx Interview Assessment Platform — Backend
 
 Django REST Framework backend for the AI-powered video interview assessment platform.
 
