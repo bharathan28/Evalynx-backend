@@ -85,19 +85,7 @@ TEMPLATES = [
 ]
 
 # ─── Database ─────────────────────────────────────────────────────────────────
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.postgresql",
-        "NAME": os.environ["DB_NAME"],
-        "USER": os.environ["DB_USER"],
-        "PASSWORD": os.environ["DB_PASSWORD"],
-        "HOST": os.getenv("DB_HOST", "localhost"),
-        "PORT": os.getenv("DB_PORT", "5432"),
-        "OPTIONS": {
-            "connect_timeout": 10,
-        },
-    }
-}
+
 DATABASES = {
     "default": dj_database_url.parse(
         os.environ.get("DATABASE_URL")
