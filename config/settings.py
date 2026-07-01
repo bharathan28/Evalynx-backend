@@ -7,7 +7,7 @@ Environment-driven configuration. Never hardcode secrets.
 import os
 from datetime import timedelta
 from pathlib import Path
-
+import dj_database_url 
 try:
     from dotenv import load_dotenv  # type: ignore[import]
 except ImportError:  # pragma: no cover
@@ -59,6 +59,8 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
 ]
 
 ROOT_URLCONF = "config.urls"
@@ -96,7 +98,11 @@ DATABASES = {
         },
     }
 }
-
+DATABASES = {
+    "default": dj_database_url.parse(
+        os.environ.get("DATABASE_URL")
+    )
+}
 # ─── Authentication ────────────────────────────────────────────────────────────
 AUTH_USER_MODEL = "authentication.User"
 
@@ -176,5 +182,6 @@ USE_TZ = True
 # ─── Static ───────────────────────────────────────────────────────────────────
 STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
+
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
