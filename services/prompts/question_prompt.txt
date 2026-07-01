@@ -1,3 +1,4 @@
+Return STRICT JSON only.
 You are a senior technical interviewer at a top-tier technology company.
 
 Generate exactly {count} technical interview questions for a candidate applying for the following role:
@@ -17,6 +18,11 @@ Rules:
 - Avoid generic questions. Each question must be specific and insightful.
 - Questions should be progressively more challenging.
 - Do NOT include answers.
+- No markdown
+- No explanation
+- No trailing commas
+- Complete full JSON object
+- Return valid JSON parsable by Python json.loads()
 
 Return ONLY a valid JSON array of question strings. No markdown. No explanation.
 

@@ -3,6 +3,18 @@ Interview service layer.
 
 Orchestrates the full answer-processing pipeline:
   video → audio extraction → transcription → local processing → AI evaluation
+
+Key behaviour notes (read before modifying):
+  - get_question() works for ACTIVE, COMPLETED, and CANCELLED interviews
+    (read-only). This matters because the moment the LAST answer is
+    submitted, interview.advance() flips status to COMPLETED. A frontend
+    that still tries to fetch/skip "the next question" right after that
+    must not get a hard 400 — it should be told plainly that the
+    interview has finished.
+  - submit_answer() and skip_question() still require an ACTIVE interview,
+    since you can't modify a finished session. Both return the interview
+    object alongside the answer so the view can tell the frontend exactly
+    what to do next (go to results vs. continue) in a single response.
 """
 
 from __future__ import annotations
@@ -11,8 +23,6 @@ import logging
 import os
 import tempfile
 import uuid
-
-from django.conf import settings
 
 from apps.authentication.models import User
 from services.ai.question_generator import QuestionGeneratorService
@@ -26,6 +36,13 @@ from .models import Answer, Interview, InterviewStatus, Question
 
 logger = logging.getLogger(__name__)
 
+# Interview statuses that allow read-only access (fetching/viewing questions)
+READABLE_STATUSES = (
+    InterviewStatus.ACTIVE,
+    InterviewStatus.COMPLETED,
+    InterviewStatus.CANCELLED,
+)
+
 
 class InterviewService:
 
@@ -35,7 +52,6 @@ class InterviewService:
         Create an Interview record, generate AI questions, persist them,
         and return the interview + ordered question list.
         """
-        # Retrieve the user's profile to enrich question generation
         try:
             profile = user.profile
             profile_summary = {
@@ -77,11 +93,52 @@ class InterviewService:
 
     @staticmethod
     def get_question(interview_id: uuid.UUID, question_number: int, user: User) -> Question:
-        interview = InterviewService._get_active_interview(interview_id, user)
+        """
+        Fetch a question. Works for ACTIVE, COMPLETED, and CANCELLED
+        interviews — fetching/viewing a question is always safe, even
+        after the session has ended.
+        """
+        interview = InterviewService._get_interview(interview_id, user, require_active=False)
         try:
             return interview.questions.get(question_number=question_number)
         except Question.DoesNotExist:
             raise ValueError(f"Question {question_number} does not exist in this interview.")
+
+    @staticmethod
+    def skip_question(interview_id: uuid.UUID, question_number: int, user: User) -> tuple[Answer, Interview]:
+        """Mark a question as skipped. Requires an ACTIVE interview."""
+        interview = InterviewService._get_interview(interview_id, user, require_active=True)
+        question = interview.questions.filter(question_number=question_number).first()
+        if question is None:
+            raise ValueError(f"Question {question_number} does not exist in this interview.")
+
+        if hasattr(question, "answer"):
+            raise ValueError("This question has already been answered or skipped.")
+
+        answer = Answer.objects.create(
+            question=question,
+            transcript="",
+            is_skipped=True,
+            technical_score=0.0,
+            grammar_score=0.0,
+            communication_score=0.0,
+            confidence_score=0.0,
+            completeness_score=0.0,
+            filler_count=0,
+            filler_details={},
+            feedback="Candidate skipped this question.",
+            better_answer="",
+            missing_concepts=[],
+            mistakes=["Question skipped"],
+            grammar_mistakes_count=0,
+            grammar_suggestions=[],
+        )
+
+        interview.advance()
+        interview.refresh_from_db()
+
+        logger.info("Question %d skipped — interview %s", question_number, interview_id)
+        return answer, interview
 
     @staticmethod
     def submit_answer(
@@ -90,20 +147,29 @@ class InterviewService:
         user: User,
         video_file=None,
         transcript_override: str = "",
-    ) -> Answer:
+    ) -> tuple[Answer, Interview]:
         """
         Process a submitted answer through the full pipeline and persist scores.
         Video (if provided) is deleted immediately after transcription.
+        Requires an ACTIVE interview. Returns (answer, interview) so the
+        caller can immediately tell whether this was the final question.
         """
-        interview = InterviewService._get_active_interview(interview_id, user)
-        question = InterviewService.get_question(interview_id, question_number, user)
+        interview = InterviewService._get_interview(interview_id, user, require_active=True)
+        question = interview.questions.filter(question_number=question_number).first()
+        if question is None:
+            raise ValueError(f"Question {question_number} does not exist in this interview.")
+
+        if hasattr(question, "answer"):
+            raise ValueError("This question has already been answered or skipped.")
 
         # ── Step 1: Transcription ───────────────────────────────────────────────
         if transcript_override:
             transcript = transcript_override
             audio_metadata = {}
-        else:
+        elif video_file:
             transcript, audio_metadata = InterviewService._process_video(video_file)
+        else:
+            raise ValueError("Either a video file or a transcript_override is required.")
 
         # ── Step 2: Local processing (no API cost) ─────────────────────────────
         grammar_result = GrammarCheckerService.check(transcript)
@@ -114,7 +180,7 @@ class InterviewService:
             filler_count=filler_result["total_count"],
         )
 
-        # ── Step 3: AI evaluation (single API call per answer) ─────────────────
+        # ── Step 3: AI evaluation (single Gemini call per answer) ──────────────
         ai_result = TechnicalEvaluatorService.evaluate(
             question=question.question_text,
             transcript=transcript,
@@ -140,16 +206,17 @@ class InterviewService:
         )
 
         interview.advance()
+        interview.refresh_from_db()
+
         logger.info("Answer submitted for Q%d in interview %s", question_number, interview_id)
-        return answer
+        return answer, interview
 
     @staticmethod
     def cancel_interview(interview_id: uuid.UUID, user: User) -> Interview:
-        interview = InterviewService._get_active_interview(interview_id, user)
+        interview = InterviewService._get_interview(interview_id, user, require_active=True)
         interview.status = InterviewStatus.CANCELLED
         interview.save(update_fields=["status", "updated_at"])
 
-        # Trigger analytics generation for partial results
         from apps.analytics.services import AnalyticsService
         AnalyticsService.generate_result(interview)
 
@@ -158,35 +225,38 @@ class InterviewService:
 
     @staticmethod
     def _process_video(video_file) -> tuple[str, dict]:
-        """
-        Save video to a temp file, extract audio, transcribe, then delete.
-        Returns (transcript, audio_metadata).
-        """
         tmp_video_path: str | None = None
         try:
-            suffix = ".webm"
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False, dir="/tmp") as tmp:
+            with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
                 tmp_video_path = tmp.name
                 for chunk in video_file.chunks():
                     tmp.write(chunk)
 
-            transcript, metadata = SpeechToTextService.transcribe(tmp_video_path)
-            return transcript, metadata
+            return SpeechToTextService.transcribe(tmp_video_path)
         finally:
             if tmp_video_path and os.path.exists(tmp_video_path):
-                os.remove(tmp_video_path)
-                logger.debug("Temp video deleted: %s", tmp_video_path)
+                try:
+                    os.remove(tmp_video_path)
+                except OSError:
+                    pass
 
     @staticmethod
-    def _get_active_interview(interview_id: uuid.UUID, user: User) -> Interview:
+    def _get_interview(interview_id: uuid.UUID, user: User, require_active: bool) -> Interview:
         try:
             interview = Interview.objects.get(id=interview_id, user=user)
         except Interview.DoesNotExist:
             raise ValueError("Interview not found.")
-        if interview.status not in (InterviewStatus.ACTIVE,):
-            raise ValueError(
-                f"Interview is not active (current status: {interview.status})."
-            )
+
+        if require_active:
+            if interview.status != InterviewStatus.ACTIVE:
+                raise ValueError(
+                    f"This interview has already ended (status: {interview.status}). "
+                    "No further answers can be submitted."
+                )
+        else:
+            if interview.status not in READABLE_STATUSES:
+                raise ValueError(f"Interview is not accessible (status: {interview.status}).")
+
         return interview
 
     @staticmethod

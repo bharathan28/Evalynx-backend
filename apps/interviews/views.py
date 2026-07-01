@@ -1,3 +1,5 @@
+import logging
+
 from rest_framework import status
 from rest_framework.parsers import JSONParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
@@ -18,6 +20,8 @@ from .serializers import (
 )
 from .services import InterviewService
 
+logger = logging.getLogger(__name__)
+
 
 class StartInterviewView(APIView):
     permission_classes = [IsAuthenticated]
@@ -32,8 +36,9 @@ class StartInterviewView(APIView):
                 **serializer.validated_data,
             )
         except Exception as exc:
+            logger.exception("Failed to start interview: %s", exc)
             return Response(
-                {"success": False, "error": {"message": str(exc)}},
+                {"success": False, "error": {"message": "Could not start interview. Please try again."}},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
@@ -50,6 +55,13 @@ class StartInterviewView(APIView):
 
 
 class GetQuestionView(APIView):
+    """
+    Fetch a single question by number.
+
+    Works for ACTIVE, COMPLETED, and CANCELLED interviews — viewing a
+    question is always read-only-safe, even after the interview ends.
+    """
+
     permission_classes = [IsAuthenticated]
 
     def get(self, request: Request) -> Response:
@@ -68,7 +80,7 @@ class GetQuestionView(APIView):
                 question_number=int(question_number),
                 user=request.user,
             )
-        except ValueError as exc:
+        except (ValueError, TypeError) as exc:
             return Response(
                 {"success": False, "error": {"message": str(exc)}},
                 status=status.HTTP_404_NOT_FOUND,
@@ -77,21 +89,42 @@ class GetQuestionView(APIView):
         return Response({"success": True, "data": QuestionSerializer(question).data})
 
 
+def _interview_progress_payload(answer, interview) -> dict:
+    """
+    Shared response shape for submit-answer and skip — tells the frontend
+    exactly what to do next without it having to guess or make another
+    (potentially failing) request.
+    """
+    is_last = interview.completed_questions >= interview.question_count
+    return {
+        "answer": AnswerSerializer(answer).data,
+        "interview_status": interview.status,
+        "completed_questions": interview.completed_questions,
+        "question_count": interview.question_count,
+        "is_complete": interview.status == "completed",
+        "is_last_question": is_last,
+        "next_question_number": None if is_last else interview.completed_questions + 1,
+    }
+
+
 class SubmitAnswerView(APIView):
     permission_classes = [IsAuthenticated]
     parser_classes = [MultiPartParser, JSONParser]
 
     def post(self, request: Request) -> Response:
-        data = {**request.data}
-        if "video" in request.FILES:
-            data["video"] = request.FILES["video"]
-
-        serializer = SubmitAnswerSerializer(data=data)
+        serializer = SubmitAnswerSerializer(
+            data={
+                "interview_id": request.data.get("interview_id"),
+                "question_number": request.data.get("question_number"),
+                "video": request.FILES.get("video"),
+                "transcript_override": request.data.get("transcript_override", ""),
+            }
+        )
         serializer.is_valid(raise_exception=True)
         vd = serializer.validated_data
 
         try:
-            answer = InterviewService.submit_answer(
+            answer, interview = InterviewService.submit_answer(
                 interview_id=vd["interview_id"],
                 question_number=vd["question_number"],
                 user=request.user,
@@ -104,14 +137,51 @@ class SubmitAnswerView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         except Exception as exc:
+            logger.exception("Submit answer failed: %s", exc)
             return Response(
-                {"success": False, "error": {"message": "Processing failed.", "detail": str(exc)}},
+                {
+                    "success": False,
+                    "error": {
+                        "message": "We couldn't process that answer. Please try again.",
+                        "detail": str(exc),
+                    },
+                },
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
         return Response(
-            {"success": True, "data": AnswerSerializer(answer).data},
+            {"success": True, "data": _interview_progress_payload(answer, interview)},
             status=status.HTTP_200_OK,
+        )
+
+
+class SkipQuestionView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request: Request) -> Response:
+        interview_id = request.data.get("interview_id")
+        question_number = request.data.get("question_number")
+
+        if not interview_id or question_number is None:
+            return Response(
+                {"success": False, "error": {"message": "interview_id and question_number are required."}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            answer, interview = InterviewService.skip_question(
+                interview_id=interview_id,
+                question_number=int(question_number),
+                user=request.user,
+            )
+        except (ValueError, TypeError) as exc:
+            return Response(
+                {"success": False, "error": {"message": str(exc)}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response(
+            {"success": True, "data": _interview_progress_payload(answer, interview)}
         )
 
 
@@ -181,10 +251,10 @@ class InterviewDetailView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request: Request, interview_id: str) -> Response:
+        from .models import Interview
         try:
-            from .models import Interview
             interview = Interview.objects.get(id=interview_id, user=request.user)
-        except Exception:
+        except Interview.DoesNotExist:
             return Response(
                 {"success": False, "error": {"message": "Interview not found."}},
                 status=status.HTTP_404_NOT_FOUND,

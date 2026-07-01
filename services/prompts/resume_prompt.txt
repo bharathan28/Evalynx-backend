@@ -34,8 +34,12 @@ The JSON must conform exactly to this schema:
   "certifications": ["string"]
 }
 
+Return STRICT JSON only.
+
 Rules:
-- Extract all skills as individual strings (not grouped).
-- If a field cannot be determined, use an empty string or empty array.
-- Do not invent or infer information not present in the text.
-- Dates should be in "Month YYYY" or "YYYY" format where possible.
+1. No markdown
+2. No ```json
+3. No explanation text
+4. No trailing commas
+5. Must be valid JSON for Python json.loads()
+6. Finish the entire JSON object before stopping

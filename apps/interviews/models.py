@@ -78,10 +78,10 @@ class Answer(models.Model):
     question = models.OneToOneField(
         Question, on_delete=models.CASCADE, related_name="answer"
     )
-
+    
     # Transcription
     transcript = models.TextField(blank=True)
-
+    is_skipped = models.BooleanField(default=False)
     # Scores (0–10 scale, stored as floats for precision)
     technical_score = models.FloatField(null=True, blank=True)
     grammar_score = models.FloatField(null=True, blank=True)

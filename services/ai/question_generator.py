@@ -48,15 +48,15 @@ class QuestionGeneratorService:
                 model_name=settings.GEMINI_MODEL,
                 generation_config=genai.GenerationConfig(
                     response_mime_type="application/json",
-                    temperature=0.7,        # Slight creativity for variety
-                    max_output_tokens=1500,
+                    temperature=0.7,
+                    max_output_tokens=4000,
                 ),
             )
 
             response = model.generate_content(prompt)
-            parsed = json.loads(response.text)
+            cleaned = response.text.strip().replace("```json", "").replace("```", "")
+            parsed = json.loads(cleaned)
 
-            # Response may be a list directly or wrapped in an object key
             if isinstance(parsed, list):
                 questions = parsed
             else:
@@ -66,10 +66,10 @@ class QuestionGeneratorService:
 
             questions = [str(q) for q in questions[:count]]
 
-            # Pad with fallbacks if Gemini returned fewer than requested
             if len(questions) < count:
                 questions += cls._fallback_questions(count - len(questions))
 
+            logger.info("Generated %d interview questions.", len(questions))
             return questions
 
         except Exception as exc:

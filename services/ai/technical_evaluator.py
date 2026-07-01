@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 
 import google.generativeai as genai
@@ -32,40 +33,52 @@ class TechnicalEvaluatorService:
     def evaluate(cls, question: str, transcript: str) -> dict:
         """
         Evaluate the candidate's answer using Gemini.
-        Returns a dict with scores, feedback, and a model answer.
-        Always returns a safe default dict on failure.
+        Returns a structured result dict. Always returns a safe fallback on failure.
         """
         if not transcript.strip():
             return cls._no_answer_result()
 
-        prompt = _PROMPT_TEMPLATE.format(
-            question=question[:2000],
-            transcript=transcript[:4000],
-        )
+        try:
+            prompt = _PROMPT_TEMPLATE.format(
+                question=question[:2000],
+                transcript=transcript[:4000],
+            )
+        except Exception as exc:
+            logger.error("Evaluation prompt formatting failed: %s", exc)
+            return cls._error_result()
 
         try:
             model = genai.GenerativeModel(
                 model_name=settings.GEMINI_MODEL,
-                generation_config=genai.GenerationConfig(
-                    response_mime_type="application/json",
-                    temperature=0.0,        # Consistent, reproducible scoring
-                    max_output_tokens=1200,
-                ),
             )
-
             response = model.generate_content(prompt)
-            result = json.loads(response.text)
 
-            # Clamp scores to [0, 10]
-            for score_key in ("technical_score", "completeness_score"):
-                if score_key in result and result[score_key] is not None:
-                    result[score_key] = max(0.0, min(10.0, float(result[score_key])))
+            raw = response.text.strip()
 
-            return result
+            # Strip markdown fences if Gemini wraps the response
+            raw = raw.replace("```json", "").replace("```", "").strip()
+
+            # Extract first JSON object found in the response
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if not match:
+                logger.error("Gemini evaluation returned no JSON object.")
+                return cls._error_result()
+
+            result = json.loads(match.group(0))
+
+            return {
+                "technical_score": max(0.0, min(10.0, float(result.get("technical_score", 0)))),
+                "completeness_score": max(0.0, min(10.0, float(result.get("completeness_score", 0)))),
+                "missing_concepts": result.get("missing_concepts", []),
+                "mistakes": result.get("mistakes", []),
+                "feedback": result.get("feedback", ""),
+                "better_answer": result.get("better_answer", ""),
+            }
 
         except json.JSONDecodeError as exc:
             logger.error("Evaluator JSON decode error: %s", exc)
             return cls._error_result()
+
         except Exception as exc:
             logger.exception("Evaluator Gemini error: %s", exc)
             return cls._error_result()
@@ -76,7 +89,7 @@ class TechnicalEvaluatorService:
             "technical_score": 0.0,
             "completeness_score": 0.0,
             "missing_concepts": [],
-            "mistakes": ["No answer was provided."],
+            "mistakes": ["No answer provided."],
             "feedback": "No answer was detected for this question.",
             "better_answer": "",
         }
@@ -84,8 +97,8 @@ class TechnicalEvaluatorService:
     @staticmethod
     def _error_result() -> dict:
         return {
-            "technical_score": None,
-            "completeness_score": None,
+            "technical_score": 0.0,
+            "completeness_score": 0.0,
             "missing_concepts": [],
             "mistakes": [],
             "feedback": "Evaluation unavailable due to a processing error.",

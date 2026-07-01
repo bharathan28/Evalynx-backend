@@ -1,17 +1,18 @@
 """
-Speech-to-Text Service — Powered by Google Gemini.
+Speech to Text Service — Local Whisper (no API cost per call).
 
-Gemini 1.5 Flash/Pro natively understands audio, so we send the extracted
-audio file directly — no separate Whisper dependency needed.
+Flow:
+  video (.webm) -> ffmpeg extract audio (.wav) -> whisper transcribe -> text
 
-Pipeline:
-  1. Extract audio from video using ffmpeg (16kHz mono WAV — minimal size)
-  2. Upload audio to Gemini Files API (temp upload, auto-deleted by Google)
-  3. Ask Gemini to transcribe
-  4. Delete local temp files immediately
+The Whisper model is loaded LAZILY on first use (not at import time).
+This prevents the entire Django process from crashing on startup if the
+model download fails, torch isn't available, or there's no internet on
+first boot. Subsequent calls reuse the cached model instance.
 
-Gemini Files API auto-deletes uploaded files after 48 hours, but we also
-explicitly delete after transcription for privacy compliance.
+ffmpeg / ffprobe paths are read from Django settings (FFMPEG_PATH /
+FFPROBE_PATH), which default to "ffmpeg" / "ffprobe" on PATH but can be
+overridden in .env — this matters most on Windows where ffmpeg often
+isn't globally registered on PATH.
 """
 
 from __future__ import annotations
@@ -20,25 +21,24 @@ import logging
 import os
 import subprocess
 import tempfile
-import time
 
-import google.generativeai as genai
 from django.conf import settings
 
 logger = logging.getLogger(__name__)
 
+# Lazily-loaded global model — populated on first transcribe() call
+_WHISPER_MODEL = None
 
-def _configure():
-    genai.configure(api_key=settings.GEMINI_API_KEY)
 
-_configure()
-
-_TRANSCRIPTION_PROMPT = (
-    "Transcribe the speech in this audio file exactly as spoken. "
-    "Output only the transcription text — no labels, no timestamps, "
-    "no commentary, no formatting. If the audio is silent or inaudible, "
-    "output an empty string."
-)
+def _get_whisper_model():
+    """Load the Whisper model once, on first use, and cache it."""
+    global _WHISPER_MODEL
+    if _WHISPER_MODEL is None:
+        import whisper  # Imported here so a missing/broken install doesn't crash startup
+        logger.info("Loading Whisper model (base) — first use only, may take a moment…")
+        _WHISPER_MODEL = whisper.load_model("base")
+        logger.info("Whisper model loaded successfully.")
+    return _WHISPER_MODEL
 
 
 class SpeechToTextService:
@@ -46,111 +46,85 @@ class SpeechToTextService:
     @classmethod
     def transcribe(cls, video_path: str) -> tuple[str, dict]:
         """
-        Extract audio from video, transcribe via Gemini, return
-        (transcript_text, audio_metadata). All temp files are deleted here.
-        The caller is responsible for deleting the original video file.
+        Extract audio from video and transcribe using local Whisper.
+        Returns (transcript, metadata). Raises ValueError with a clear
+        message on failure so the caller can surface it to the user.
         """
         audio_path: str | None = None
-        gemini_file = None
 
         try:
-            audio_path, duration_seconds = cls._extract_audio(video_path)
-            gemini_file = cls._upload_to_gemini(audio_path)
-            transcript = cls._transcribe_with_gemini(gemini_file)
+            audio_path, duration = cls._extract_audio(video_path)
+
+            model = _get_whisper_model()
+            result = model.transcribe(audio_path, language="en", fp16=False)
+            transcript = (result.get("text") or "").strip()
 
             metadata = {
-                "duration_seconds": duration_seconds,
+                "duration_seconds": duration,
                 "word_count": len(transcript.split()),
             }
             return transcript, metadata
 
+        except FileNotFoundError as exc:
+            # ffmpeg/ffprobe binary not found on the system
+            logger.exception("ffmpeg/ffprobe not found: %s", exc)
+            raise ValueError(
+                "Audio processing tool (ffmpeg) was not found on this server. "
+                "Install ffmpeg and ensure it's on PATH, or set FFMPEG_PATH / "
+                "FFPROBE_PATH in your .env file to the full executable path."
+            ) from exc
+
         except Exception as exc:
-            logger.exception("Transcription error for %s: %s", video_path, exc)
-            return "", {}
+            logger.exception("Transcription error: %s", exc)
+            raise ValueError(f"Transcription failed: {exc}") from exc
 
         finally:
-            # Delete local audio temp file
             if audio_path and os.path.exists(audio_path):
-                os.remove(audio_path)
-                logger.debug("Temp audio deleted: %s", audio_path)
-            # Delete uploaded Gemini file
-            if gemini_file:
                 try:
-                    genai.delete_file(gemini_file.name)
-                    logger.debug("Gemini file deleted: %s", gemini_file.name)
-                except Exception:
-                    pass  # Non-fatal — Gemini auto-deletes after 48h anyway
+                    os.remove(audio_path)
+                except OSError:
+                    pass
 
     @classmethod
     def _extract_audio(cls, video_path: str) -> tuple[str, float]:
-        """
-        Use ffmpeg to extract audio as 16kHz mono WAV.
-        16kHz mono is optimal for speech recognition and minimises upload size.
-        Returns (audio_path, duration_seconds).
-        """
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir="/tmp") as tmp:
+        """Extract 16kHz mono WAV audio from the video using ffmpeg."""
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             audio_path = tmp.name
 
+        ffmpeg_bin = getattr(settings, "FFMPEG_PATH", "ffmpeg")
+
         cmd = [
-            "ffmpeg", "-y",
+            ffmpeg_bin,
+            "-y",
             "-i", video_path,
-            "-vn",                    # Drop video stream
-            "-acodec", "pcm_s16le",  # Raw PCM
-            "-ac", "1",              # Mono
-            "-ar", "16000",          # 16 kHz
+            "-vn",
+            "-acodec", "pcm_s16le",
+            "-ac", "1",
+            "-ar", "16000",
             audio_path,
         ]
-        result = subprocess.run(cmd, capture_output=True, timeout=120)
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=120)
+        except FileNotFoundError:
+            # Re-raise with the binary name so the caller's message is accurate
+            raise FileNotFoundError(f"'{ffmpeg_bin}' executable not found")
 
         if result.returncode != 0:
-            raise RuntimeError(
-                f"ffmpeg audio extraction failed: {result.stderr.decode()[:500]}"
-            )
+            stderr = result.stderr.decode(errors="ignore")[:500]
+            raise RuntimeError(f"ffmpeg failed: {stderr}")
 
-        return audio_path, cls._get_duration(audio_path)
-
-    @staticmethod
-    def _upload_to_gemini(audio_path: str):
-        """
-        Upload audio to the Gemini Files API.
-        Waits until the file is in ACTIVE state before returning.
-        """
-        uploaded = genai.upload_file(path=audio_path, mime_type="audio/wav")
-
-        # Poll until ACTIVE (usually instant for short files)
-        max_wait = 30
-        waited = 0
-        while uploaded.state.name == "PROCESSING" and waited < max_wait:
-            time.sleep(1)
-            waited += 1
-            uploaded = genai.get_file(uploaded.name)
-
-        if uploaded.state.name != "ACTIVE":
-            raise RuntimeError(
-                f"Gemini file upload failed — state: {uploaded.state.name}"
-            )
-
-        return uploaded
-
-    @staticmethod
-    def _transcribe_with_gemini(gemini_file) -> str:
-        """Send the uploaded audio file to Gemini for transcription."""
-        model = genai.GenerativeModel(
-            model_name=settings.GEMINI_AUDIO_MODEL,
-            generation_config=genai.GenerationConfig(
-                temperature=0.0,
-                max_output_tokens=4096,
-            ),
-        )
-        response = model.generate_content([_TRANSCRIPTION_PROMPT, gemini_file])
-        return response.text.strip() if response.text else ""
+        duration = cls._get_duration(audio_path)
+        return audio_path, duration
 
     @staticmethod
     def _get_duration(audio_path: str) -> float:
-        """Get audio duration in seconds via ffprobe."""
+        """Get audio duration in seconds via ffprobe. Returns 0.0 on any failure."""
+        ffprobe_bin = getattr(settings, "FFPROBE_PATH", "ffprobe")
         try:
             cmd = [
-                "ffprobe", "-v", "error",
+                ffprobe_bin,
+                "-v", "error",
                 "-show_entries", "format=duration",
                 "-of", "default=noprint_wrappers=1:nokey=1",
                 audio_path,

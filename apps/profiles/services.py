@@ -58,7 +58,7 @@ class ProfileService:
         tmp_path: str | None = None
         try:
             with tempfile.NamedTemporaryFile(
-                suffix=".pdf", delete=False, dir="/tmp"
+                suffix=".pdf", delete=False, dir=None
             ) as tmp:
                 tmp_path = tmp.name
                 for chunk in file.chunks():

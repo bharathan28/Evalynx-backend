@@ -21,8 +21,13 @@ ffmpeg-python==0.2.0
 
 # Local Speech-to-Text (local Whisper model)
 # Uncomment if running Whisper locally instead of via API
-# openai-whisper==20231117
-# torch==2.2.2
+# Speech to Text (local Whisper)
+openai-whisper==20250625
+
+# PyTorch stack (CPU build)
+torch==2.7.1
+torchvision==0.22.1
+torchaudio==2.7.1
 
 # Grammar Checking (local, no API cost)
 language-tool-python==2.7.1
