@@ -36,6 +36,6 @@ language-tool-python==2.7.1
 gunicorn==22.0.0
 
 # Utilities
-Pillow==10.3.0
+Pillow==10.1.0
 
 dj-database-url==2.2.0
